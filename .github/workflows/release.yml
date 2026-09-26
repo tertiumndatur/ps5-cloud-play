@@ -1,0 +1,136 @@
+name: Build and release
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  ps5-packages:
+    name: Build PS5 packages
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      BUILD_JOBS: 4
+      NUGET_PACKAGES: ${{ github.workspace }}/.deps/nuget
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install LLVM and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            build-essential \
+            clang-18 \
+            cmake \
+            libclang-rt-18-dev \
+            lld-18 \
+            llvm-18-dev \
+            pkg-config \
+            python3 \
+            python3-protobuf \
+            protobuf-compiler \
+            unzip \
+            wget \
+            zip
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore PS5 build dependencies
+        uses: actions/cache@v6
+        with:
+          path: .deps
+          key: ps5-deps-${{ runner.os }}-${{ hashFiles('tools/setup-native-dependencies.sh', 'tools/setup-pacbrew-dependencies.sh', 'tools/setup-packaging-dependencies.sh', 'tools/fetch-opengl-sdk.sh', 'tools/prepare-opengl.sh') }}
+
+      - name: Build FFPKG and FFPFSC
+        run: make --no-print-directory release-packages
+
+      - name: Verify build outputs and write checksums
+        shell: bash
+        run: |
+          mapfile -t ffpkg_files < <(find dist -maxdepth 1 -type f -name '*.ffpkg' -print)
+          mapfile -t ffpfsc_files < <(find dist -maxdepth 1 -type f -name '*.ffpfsc' -print)
+          mapfile -t app_dirs < <(find dist -mindepth 1 -maxdepth 1 -type d -name 'PPSA*' -print)
+          if (( ${#ffpkg_files[@]} != 1 || ${#ffpfsc_files[@]} != 1 || ${#app_dirs[@]} != 1 )); then
+            printf 'Expected one app folder, FFPKG, and FFPFSC; found %d, %d, and %d\n' \
+              "${#app_dirs[@]}" "${#ffpkg_files[@]}" "${#ffpfsc_files[@]}" >&2
+            exit 1
+          fi
+          test -s "${ffpkg_files[0]}"
+          test -s "${ffpfsc_files[0]}"
+          test -s "${app_dirs[0]}/eboot.bin"
+          test -s "${app_dirs[0]}/sce_sys/param.json"
+          mv "${ffpkg_files[0]}" dist/CloudPlay-PS5.ffpkg
+          mv "${ffpfsc_files[0]}" dist/CloudPlay-PS5.ffpfsc
+          app_name=${app_dirs[0]#dist/}
+          (
+            cd dist
+            sha256sum CloudPlay-PS5.ffpkg CloudPlay-PS5.ffpfsc > PS5-SHA256SUMS
+            zip -9 -r CloudPlay-PS5.zip "$app_name"
+            sha256sum CloudPlay-PS5.zip >> PS5-SHA256SUMS
+            sha256sum --check PS5-SHA256SUMS
+            unzip -t CloudPlay-PS5.zip
+            unzip -Z1 CloudPlay-PS5.zip | grep -qx "$app_name/eboot.bin"
+            unzip -Z1 CloudPlay-PS5.zip | grep -qx "$app_name/sce_sys/param.json"
+          )
+
+      - name: Upload PS5 package artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ps5-packages-${{ github.sha }}
+          path: |
+            dist/*.ffpkg
+            dist/*.ffpfsc
+            dist/*.zip
+            dist/PS5-SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    name: Publish GitHub release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - ps5-packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download PS5 package
+        uses: actions/download-artifact@v8
+        with:
+          name: ps5-packages-${{ github.sha }}
+          path: release
+
+      - name: Verify downloaded checksums
+        working-directory: release
+        shell: bash
+        run: |
+          sha256sum --check PS5-SHA256SUMS
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release/* \
+              --verify-tag \
+              --generate-notes \
+              --title "$GITHUB_REF_NAME"
+          fi
