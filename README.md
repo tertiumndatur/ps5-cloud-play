@@ -18,6 +18,12 @@ output, then opens the Paper interface again when the stream ends.
 
 ## First launch and access settings
 
+Before starting setup, make sure that:
+
+- nanoDNS is installed, configured, and running for the PS5 environment.
+- The PS5 has working internet access. Account authorization, catalog loading,
+  cover downloads, and cloud streaming all require an internet connection.
+
 The package contains no NPSSO, PSN token, account ID, or DNS address. A fresh
 installation starts with all five PSN fields and all DNS resolves empty. The
 Games page stays blocked until a complete access document is accepted by the
