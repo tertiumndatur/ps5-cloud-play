@@ -6,9 +6,14 @@
 
 #include "radio_input.hpp"
 
+#include "app_log.hpp"
+#include "storage_io.hpp"
+
+#include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 
 #define INPUT_QUEUE_SIZE 64U
 #define PAD_SAMPLE_SIZE 120U
@@ -155,6 +160,8 @@ extern "C"
     extern int scePadSetTriggerEffect(int32_t handle,
                                       const pad_trigger_effect_param_t *effect);
     extern int scePadSetVibration(int32_t handle, const pad_vibration_t *vibration);
+    /* Required before adaptive trigger effects work from homebrew titles. */
+    extern int scePadSetProcessPrivilege(int32_t privilege);
     extern int sceUserServiceInitialize(void *init_params);
     extern int sceUserServiceGetInitialUser(int32_t *user_id);
     extern int sceUserServiceTerminate(void);
@@ -180,6 +187,32 @@ static uint64_t analog_repeat_at;
 static int32_t pad_handle = -1;
 static bool owns_user_service;
 static radio_input_pad_state_t latest_pad;
+static char pad_diag[1024];
+static int last_privilege_result = 1;
+static int last_trigger_result = 1;
+
+/* Durable diagnostics — debug.log is circular and trims early pad events. */
+static void pad_diag_write(void)
+{
+#if CLOUDPLAY_PS5
+    const char *paths[] = {
+        "/download0/pad_diag.txt",
+        "/data/cloudplay-pad_diag.txt",
+    };
+    for (const char *path : paths)
+        (void)cloudplay::storage_write_atomic(path, pad_diag);
+#endif
+}
+
+static void pad_diag_append(const char *key, int64_t value)
+{
+    const size_t used = strnlen(pad_diag, sizeof(pad_diag));
+    if (used + 48 >= sizeof(pad_diag))
+        return;
+    (void)snprintf(pad_diag + used, sizeof(pad_diag) - used, "%s=%lld\n", key,
+                   static_cast<long long>(value));
+    pad_diag_write();
+}
 
 static uint8_t effect_strength(uint8_t strength, uint8_t intensity)
 {
@@ -403,21 +436,40 @@ bool radio_input_init(void)
     memset(&latest_pad, 0, sizeof(latest_pad));
     latest_pad.left_x = latest_pad.left_y = 128;
     latest_pad.right_x = latest_pad.right_y = 128;
+    pad_diag[0] = '\0';
+    pad_diag_append("pid", getpid());
+
     const int user_init = sceUserServiceInitialize(NULL);
     owns_user_service = user_init == 0;
+    pad_diag_append("user_init", user_init);
 
     int32_t user_id = -1;
-    if (sceUserServiceGetInitialUser(&user_id) < 0 || scePadInit() < 0)
+    const int user_get = sceUserServiceGetInitialUser(&user_id);
+    pad_diag_append("user_id", user_id);
+    pad_diag_append("user_get", user_get);
+    const int pad_init = scePadInit();
+    pad_diag_append("pad_init", pad_init);
+    if (user_get < 0 || pad_init < 0)
     {
         radio_input_shutdown();
         return false;
     }
+    /* Homebrew apps need elevated pad privilege for scePadSetTriggerEffect. */
+    last_privilege_result = scePadSetProcessPrivilege(1);
+    cloudplay::app_log("pad", "set_process_privilege", last_privilege_result);
+    pad_diag_append("set_process_privilege", last_privilege_result);
     pad_handle = scePadOpen(user_id, 0, 0, NULL);
     if (pad_handle < 0)
     {
+        pad_diag_append("pad_open", pad_handle);
         radio_input_shutdown();
         return false;
     }
+    cloudplay::app_log("pad", "open", pad_handle);
+    pad_diag_append("pad_open", pad_handle);
+    /* Some titles need privilege after the handle exists. */
+    last_privilege_result = scePadSetProcessPrivilege(1);
+    pad_diag_append("set_process_privilege_after_open", last_privilege_result);
     (void)scePadSetMotionSensorState(pad_handle, true);
     queue_read = queue_write = 0;
     button_state = 0;
@@ -482,13 +534,96 @@ bool radio_input_set_trigger_effects(uint8_t left_type, const uint8_t left[10],
     effect.trigger_mask = 0x03;
     decode_trigger_effect(&effect.command[0], left_type, left, intensity);
     decode_trigger_effect(&effect.command[1], right_type, right, intensity);
-    return scePadSetTriggerEffect(pad_handle, &effect) >= 0;
+    last_trigger_result = scePadSetTriggerEffect(pad_handle, &effect);
+    if (last_trigger_result < 0)
+    {
+        static unsigned fail_logs;
+        if (fail_logs < 8U)
+        {
+            ++fail_logs;
+            cloudplay::app_log("pad", "set_trigger_effect", last_trigger_result);
+            pad_diag_append("set_trigger_effect", last_trigger_result);
+            pad_diag_append("trigger_left_type", left_type);
+            pad_diag_append("trigger_right_type", right_type);
+        }
+        return false;
+    }
+    static unsigned ok_logs;
+    if (ok_logs < 2U)
+    {
+        ++ok_logs;
+        pad_diag_append("set_trigger_effect_ok", last_trigger_result);
+        cloudplay::app_log("pad", "set_trigger_effect_ok", last_trigger_result);
+    }
+    return true;
 }
 
 bool radio_input_clear_trigger_effects(void)
 {
     const uint8_t empty[10] = {};
     return radio_input_set_trigger_effects(0x05, empty, 0x05, empty, 1);
+}
+
+int radio_input_run_trigger_test(int mode)
+{
+    if (pad_handle < 0)
+    {
+        last_trigger_result = -1;
+        pad_diag_append("trigger_test_no_pad", last_trigger_result);
+        return last_trigger_result;
+    }
+
+    /* Retry privilege right before the effect — useful for settings tests. */
+    last_privilege_result = scePadSetProcessPrivilege(1);
+    pad_diag_append("trigger_test_privilege", last_privilege_result);
+
+    uint8_t left[10] = {};
+    uint8_t right[10] = {};
+    uint8_t left_type = 0x05;
+    uint8_t right_type = 0x05;
+    switch (mode)
+    {
+    case 1: /* Soft resistance on both triggers */
+        left_type = right_type = 0x01;
+        left[0] = right[0] = 5;
+        left[1] = right[1] = 8;
+        break;
+    case 2: /* Weapon-style hard stop */
+        left_type = right_type = 0x02;
+        left[0] = right[0] = 2;
+        left[1] = right[1] = 7;
+        left[2] = right[2] = 8;
+        break;
+    case 3: /* Trigger vibration — chiaki layout: freq, amp, position */
+        left_type = right_type = 0x06;
+        left[0] = right[0] = 8; /* frequency (0 disables the effect) */
+        left[1] = right[1] = 8; /* amplitude */
+        left[2] = right[2] = 5; /* position 0..9 */
+        break;
+    default: /* Clear / off */
+        left_type = right_type = 0x05;
+        mode = 0;
+        break;
+    }
+
+    (void)radio_input_set_trigger_effects(left_type, left, right_type, right, 1);
+    pad_diag_append("trigger_test_mode", mode);
+    pad_diag_append("trigger_test_result", last_trigger_result);
+    /* Also log as unsigned hex-friendly decimal for SCE error codes. */
+    pad_diag_append("trigger_test_result_u",
+                    static_cast<int64_t>(static_cast<uint32_t>(last_trigger_result)));
+    cloudplay::app_log("pad", "trigger_test", last_trigger_result);
+    return last_trigger_result;
+}
+
+int radio_input_last_privilege_result(void)
+{
+    return last_privilege_result;
+}
+
+int radio_input_last_trigger_result(void)
+{
+    return last_trigger_result;
 }
 
 bool radio_input_pad_state(radio_input_pad_state_t *state)

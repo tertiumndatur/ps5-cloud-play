@@ -125,7 +125,8 @@ owners.
 - VideoDec2/AGC supports H.264 and HEVC. The 1440p and 2160p modes still need
   broader runtime testing.
 - Buttons, analog triggers, sticks, touch contacts, controller motion, and
-  standard rumble are forwarded. Adaptive trigger effects and DualSense haptic
-  audio are not yet supported.
+  standard rumble are forwarded. Adaptive trigger effects are attempted via
+  `scePadSetTriggerEffect` after `scePadSetProcessPrivilege(1)` (homebrew
+  privilege). DualSense haptic audio is still approximated as standard rumble.
 - Catalog availability depends on account region, PlayStation Plus tier, and
   title entitlement; Sony can decline a listed title during allocation.

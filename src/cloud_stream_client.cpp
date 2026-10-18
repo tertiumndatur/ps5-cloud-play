@@ -124,11 +124,16 @@ struct CloudStreamClient::Impl {
             (void)radio_input_set_vibration(value->rumble.left, value->rumble.right);
         }
         else if (value->type == CHIAKI_EVENT_TRIGGER_EFFECTS) {
+            const uint8_t intensity =
+                self->trigger_intensity.load(std::memory_order_relaxed);
             const bool applied = radio_input_set_trigger_effects(
                 value->trigger_effects.type_left, value->trigger_effects.left,
                 value->trigger_effects.type_right, value->trigger_effects.right,
-                self->trigger_intensity.load(std::memory_order_relaxed));
-            if (!applied) app_log("stream", "trigger_effect_failed");
+                intensity);
+            if (!applied)
+                app_log("stream", "trigger_effect_failed",
+                        (static_cast<int>(value->trigger_effects.type_left) << 16) |
+                            value->trigger_effects.type_right);
         }
         else if (value->type == CHIAKI_EVENT_HAPTIC_INTENSITY) {
             self->haptic_intensity.store(static_cast<uint8_t>(value->intensity),

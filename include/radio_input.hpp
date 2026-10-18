@@ -69,6 +69,12 @@ bool radio_input_set_trigger_effects(uint8_t left_type, const uint8_t left[10],
                                      uint8_t right_type, const uint8_t right[10],
                                      uint8_t intensity);
 bool radio_input_clear_trigger_effects(void);
+/* Local DualSense check without a cloud stream.
+ * mode 0=clear, 1=feedback, 2=weapon, 3=vibration.
+ * Returns the raw scePadSetTriggerEffect result (0 on success). */
+int radio_input_run_trigger_test(int mode);
+int radio_input_last_privilege_result(void);
+int radio_input_last_trigger_result(void);
 void radio_input_shutdown(void);
 
 #ifdef __cplusplus
