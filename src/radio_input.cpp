@@ -6,9 +6,14 @@
 
 #include "radio_input.hpp"
 
+#include "app_log.hpp"
+#include "storage_io.hpp"
+
+#include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 
 #define INPUT_QUEUE_SIZE 64U
 #define PAD_SAMPLE_SIZE 120U
@@ -114,6 +119,14 @@ typedef union
     } multiple_feedback;
     struct
     {
+        uint8_t start_position;
+        uint8_t end_position;
+        uint8_t start_strength;
+        uint8_t end_strength;
+        uint8_t padding[44];
+    } slope_feedback;
+    struct
+    {
         uint8_t frequency;
         uint8_t amplitude[10];
         uint8_t padding[37];
@@ -155,6 +168,8 @@ extern "C"
     extern int scePadSetTriggerEffect(int32_t handle,
                                       const pad_trigger_effect_param_t *effect);
     extern int scePadSetVibration(int32_t handle, const pad_vibration_t *vibration);
+    /* Required before adaptive trigger effects work from homebrew titles. */
+    extern int scePadSetProcessPrivilege(int32_t privilege);
     extern int sceUserServiceInitialize(void *init_params);
     extern int sceUserServiceGetInitialUser(int32_t *user_id);
     extern int sceUserServiceTerminate(void);
@@ -180,6 +195,40 @@ static uint64_t analog_repeat_at;
 static int32_t pad_handle = -1;
 static bool owns_user_service;
 static radio_input_pad_state_t latest_pad;
+static char pad_diag[1024];
+static int last_privilege_result = 1;
+static int last_trigger_result = 1;
+/* Classic rumble and haptic-audio share scePadSetVibration. Keep both and
+ * apply the louder motor so quiet haptic frames do not cancel CHIAKI rumble.
+ * Classic rumble is latched until an explicit (0,0) — cloud packets are sparse. */
+static uint8_t last_rumble_low;
+static uint8_t last_rumble_high;
+static uint8_t last_haptic_low;
+static uint8_t last_haptic_high;
+static uint64_t haptic_hold_until_ms;
+
+/* Durable diagnostics — debug.log is circular and trims early pad events. */
+static void pad_diag_write(void)
+{
+#if CLOUDPLAY_PS5
+    const char *paths[] = {
+        "/download0/pad_diag.txt",
+        "/data/cloudplay-pad_diag.txt",
+    };
+    for (const char *path : paths)
+        (void)cloudplay::storage_write_atomic(path, pad_diag);
+#endif
+}
+
+static void pad_diag_append(const char *key, int64_t value)
+{
+    const size_t used = strnlen(pad_diag, sizeof(pad_diag));
+    if (used + 48 >= sizeof(pad_diag))
+        return;
+    (void)snprintf(pad_diag + used, sizeof(pad_diag) - used, "%s=%lld\n", key,
+                   static_cast<long long>(value));
+    pad_diag_write();
+}
 
 static uint8_t effect_strength(uint8_t strength, uint8_t intensity)
 {
@@ -193,6 +242,57 @@ static uint8_t effect_strength(uint8_t strength, uint8_t intensity)
     return strength;
 }
 
+/*
+ * DualSense HID trigger modes (controllers.fandom.com / Sony factories):
+ *   0x05 Off
+ *   0x01 / 0x11 Simple|Limited Feedback
+ *   0x02 / 0x12 Simple|Limited Weapon
+ *   0x06 Simple Vibration
+ *   0x21 Feedback (zone-packed) + MultiplePosition / Slope encodings
+ *   0x22 Bow (unofficial)  0x23 Galloping  0x25 Weapon  0x26 Vibration
+ *   0x27 Machine (unofficial)
+ * scePad MULTIPLE_POSITION_* returns INVALID_ARG on this homebrew path, so
+ * zone payloads are approximated with FEEDBACK / WEAPON / VIBRATION / SLOPE.
+ */
+static void bit_range(uint16_t mask, unsigned *start, unsigned *end, bool *found)
+{
+    *found = false;
+    *start = 0;
+    *end = 0;
+    for (unsigned i = 0; i < 10; ++i)
+    {
+        if ((mask & (1U << i)) == 0)
+            continue;
+        if (!*found)
+        {
+            *start = i;
+            *found = true;
+        }
+        *end = i;
+    }
+}
+
+static void set_weapon_clamped(pad_trigger_effect_command_t *command,
+                               unsigned start, unsigned end, uint8_t strength)
+{
+    if (strength == 0)
+        return;
+    if (end <= start)
+        end = start + 1U;
+    if (start < 2U)
+        start = 2U;
+    if (start > 7U)
+        start = 7U;
+    if (end <= start)
+        end = start + 1U;
+    if (end > 8U)
+        end = 8U;
+    command->mode = PAD_TRIGGER_EFFECT_WEAPON;
+    command->data.weapon.start_position = (uint8_t)start;
+    command->data.weapon.end_position = (uint8_t)end;
+    command->data.weapon.strength = strength;
+}
+
 static void decode_zone_effect(pad_trigger_effect_command_t *command,
                                const uint8_t data[10], bool vibration,
                                uint8_t intensity)
@@ -201,35 +301,85 @@ static void decode_zone_effect(pad_trigger_effect_command_t *command,
     const uint32_t packed = (uint32_t)data[2] |
         ((uint32_t)data[3] << 8U) | ((uint32_t)data[4] << 16U) |
         ((uint32_t)data[5] << 24U);
-    bool enabled = false;
+    uint8_t strengths[10] = {};
+    int first = -1;
+    int last = -1;
+    uint8_t peak = 0;
+    bool uniform = true;
+    uint8_t first_strength = 0;
+    for (unsigned i = 0; i < 10; ++i)
+    {
+        if ((active & (1U << i)) == 0)
+            continue;
+        strengths[i] = effect_strength(
+            (uint8_t)(((packed >> (3U * i)) & 7U) + 1U), intensity);
+        if (strengths[i] == 0)
+            continue;
+        if (first < 0)
+        {
+            first = (int)i;
+            first_strength = strengths[i];
+        }
+        else if (strengths[i] != first_strength)
+            uniform = false;
+        last = (int)i;
+        if (strengths[i] > peak)
+            peak = strengths[i];
+    }
+    if (first < 0 || peak == 0)
+        return;
+
     if (vibration)
     {
-        command->mode = PAD_TRIGGER_EFFECT_MULTIPLE_POSITION_VIBRATION;
-        command->data.multiple_vibration.frequency = data[8];
-        for (unsigned i = 0; i < 10; ++i)
-        {
-            const uint8_t value = (active & (1U << i)) != 0 ?
-                (uint8_t)(((packed >> (3U * i)) & 7U) + 1U) : 0;
-            command->data.multiple_vibration.amplitude[i] =
-                effect_strength(value, intensity);
-            enabled |= command->data.multiple_vibration.amplitude[i] != 0;
-        }
-        enabled &= command->data.multiple_vibration.frequency != 0;
+        const uint8_t frequency = data[8];
+        if (frequency == 0)
+            return;
+        command->mode = PAD_TRIGGER_EFFECT_VIBRATION;
+        command->data.vibration.position = (uint8_t)first;
+        command->data.vibration.amplitude = peak;
+        command->data.vibration.frequency = frequency;
+        return;
     }
-    else
+
+    /* Official Feedback fills position..9 at one strength — use FEEDBACK. */
+    if (uniform && last == 9)
     {
-        command->mode = PAD_TRIGGER_EFFECT_MULTIPLE_POSITION_FEEDBACK;
-        for (unsigned i = 0; i < 10; ++i)
-        {
-            const uint8_t value = (active & (1U << i)) != 0 ?
-                (uint8_t)(((packed >> (3U * i)) & 7U) + 1U) : 0;
-            command->data.multiple_feedback.strength[i] =
-                effect_strength(value, intensity);
-            enabled |= command->data.multiple_feedback.strength[i] != 0;
-        }
+        command->mode = PAD_TRIGGER_EFFECT_FEEDBACK;
+        command->data.feedback.position = (uint8_t)first;
+        command->data.feedback.strength = peak;
+        return;
     }
-    if (!enabled)
-        command->mode = PAD_TRIGGER_EFFECT_OFF;
+
+    if (last > first)
+    {
+        uint8_t start_strength = strengths[first] ? strengths[first] : peak;
+        uint8_t end_strength = strengths[last] ? strengths[last] : peak;
+        if (start_strength < 1)
+            start_strength = 1;
+        if (end_strength < 1)
+            end_strength = 1;
+        /* Varying multi-zone: keep peak bite on the stronger end. */
+        if (!uniform)
+        {
+            if (start_strength < peak && end_strength < peak)
+            {
+                if (strengths[first] >= strengths[last])
+                    start_strength = peak;
+                else
+                    end_strength = peak;
+            }
+        }
+        command->mode = PAD_TRIGGER_EFFECT_SLOPE_FEEDBACK;
+        command->data.slope_feedback.start_position = (uint8_t)first;
+        command->data.slope_feedback.end_position = (uint8_t)last;
+        command->data.slope_feedback.start_strength = start_strength;
+        command->data.slope_feedback.end_strength = end_strength;
+        return;
+    }
+
+    command->mode = PAD_TRIGGER_EFFECT_FEEDBACK;
+    command->data.feedback.position = (uint8_t)first;
+    command->data.feedback.strength = peak;
 }
 
 static void decode_trigger_effect(pad_trigger_effect_command_t *command,
@@ -242,59 +392,102 @@ static void decode_trigger_effect(pad_trigger_effect_command_t *command,
 
     switch (type)
     {
-    case 0x21:
+    case 0x21: /* Feedback / MultiplePositionFeedback / SlopeFeedback */
         decode_zone_effect(command, data, false, intensity);
         break;
-    case 0x25:
+    case 0x25: /* Weapon (start+stop bit pair) */
     {
-        const uint16_t zones = (uint16_t)data[0] | ((uint16_t)data[1] << 8U);
         unsigned start = 0;
         unsigned end = 0;
         bool found = false;
-        for (unsigned i = 0; i < 10; ++i)
+        bit_range((uint16_t)data[0] | ((uint16_t)data[1] << 8U),
+                  &start, &end, &found);
+        if (found)
+            set_weapon_clamped(command, start, end,
+                               effect_strength((uint8_t)((data[2] & 7U) + 1U),
+                                               intensity));
+        break;
+    }
+    case 0x26: /* Vibration / MultiplePositionVibration */
+        decode_zone_effect(command, data, true, intensity);
+        break;
+    case 0x22: /* Bow — snap-back weapon; approximate as Weapon */
+    {
+        unsigned start = 0;
+        unsigned end = 0;
+        bool found = false;
+        bit_range((uint16_t)data[0] | ((uint16_t)data[1] << 8U),
+                  &start, &end, &found);
+        const uint8_t strength = effect_strength(
+            (uint8_t)(((data[2] >> 0) & 7U) + 1U), intensity);
+        const uint8_t snap = effect_strength(
+            (uint8_t)(((data[2] >> 3) & 7U) + 1U), intensity);
+        if (found)
+            set_weapon_clamped(command, start, end,
+                               strength > snap ? strength : snap);
+        break;
+    }
+    case 0x23: /* Galloping — rhythmic; approximate as Vibration */
+    {
+        unsigned start = 0;
+        unsigned end = 0;
+        bool found = false;
+        bit_range((uint16_t)data[0] | ((uint16_t)data[1] << 8U),
+                  &start, &end, &found);
+        const uint8_t frequency = data[3];
+        if (found && frequency)
         {
-            if ((zones & (1U << i)) == 0)
-                continue;
-            if (!found)
-            {
-                start = i;
-                found = true;
-            }
-            end = i;
-        }
-        const uint8_t strength = effect_strength((uint8_t)((data[2] & 7U) + 1U),
-                                                  intensity);
-        if (found && start >= 2 && start <= 7 && end > start && end <= 8 && strength)
-        {
-            command->mode = PAD_TRIGGER_EFFECT_WEAPON;
-            command->data.weapon.start_position = (uint8_t)start;
-            command->data.weapon.end_position = (uint8_t)end;
-            command->data.weapon.strength = strength;
+            command->mode = PAD_TRIGGER_EFFECT_VIBRATION;
+            command->data.vibration.position = (uint8_t)start;
+            command->data.vibration.amplitude = effect_strength(5, intensity);
+            command->data.vibration.frequency = frequency;
         }
         break;
     }
-    case 0x26:
-        decode_zone_effect(command, data, true, intensity);
+    case 0x27: /* Machine — dual-amplitude vibration */
+    {
+        unsigned start = 0;
+        unsigned end = 0;
+        bool found = false;
+        bit_range((uint16_t)data[0] | ((uint16_t)data[1] << 8U),
+                  &start, &end, &found);
+        const uint8_t amp_a = (uint8_t)((data[2] >> 0) & 7U);
+        const uint8_t amp_b = (uint8_t)((data[2] >> 3) & 7U);
+        const uint8_t amplitude = effect_strength(
+            (uint8_t)((amp_a > amp_b ? amp_a : amp_b) + 1U), intensity);
+        const uint8_t frequency = data[3];
+        if (found && amplitude && frequency)
+        {
+            command->mode = PAD_TRIGGER_EFFECT_VIBRATION;
+            command->data.vibration.position = (uint8_t)start;
+            command->data.vibration.amplitude = amplitude;
+            command->data.vibration.frequency = frequency;
+        }
         break;
-    case 0x01:
+    }
+    case 0x01: /* Simple Feedback */
+    case 0x11: /* Limited Feedback */
         command->mode = PAD_TRIGGER_EFFECT_FEEDBACK;
         command->data.feedback.position = data[0] > 9 ? 9 : data[0];
         command->data.feedback.strength = effect_strength(data[1], intensity);
         if (!command->data.feedback.strength)
             command->mode = PAD_TRIGGER_EFFECT_OFF;
         break;
-    case 0x02:
-        if (data[0] >= 2 && data[0] <= 7 && data[1] > data[0] && data[1] <= 8)
-        {
-            command->mode = PAD_TRIGGER_EFFECT_WEAPON;
-            command->data.weapon.start_position = data[0];
-            command->data.weapon.end_position = data[1];
-            command->data.weapon.strength = effect_strength(data[2], intensity);
-            if (!command->data.weapon.strength)
-                command->mode = PAD_TRIGGER_EFFECT_OFF;
-        }
+    case 0x02: /* Simple Weapon */
+        set_weapon_clamped(command, data[0], data[1],
+                           effect_strength(data[2], intensity));
         break;
-    case 0x06:
+    case 0x12: /* Limited Weapon — coarse positions; clamp into SCE range */
+    {
+        unsigned start = data[0] > 16U ? (unsigned)((data[0] - 16U) / 12U) : 2U;
+        unsigned end = data[1] > data[0]
+            ? start + 1U + (unsigned)((data[1] - data[0]) / 25U)
+            : start + 1U;
+        set_weapon_clamped(command, start, end,
+                           effect_strength(data[2], intensity));
+        break;
+    }
+    case 0x06: /* Simple Vibration — freq, amplitude, position */
         command->mode = PAD_TRIGGER_EFFECT_VIBRATION;
         command->data.vibration.position = data[2] > 9 ? 9 : data[2];
         command->data.vibration.amplitude = effect_strength(data[1], intensity);
@@ -303,9 +496,16 @@ static void decode_trigger_effect(pad_trigger_effect_command_t *command,
             command->mode = PAD_TRIGGER_EFFECT_OFF;
         break;
     default:
-        /* Unknown/debug effects are deliberately cleared instead of passing
-         * unsafe controller firmware commands through the native API. */
+    {
+        static unsigned unknown_logs;
+        if (unknown_logs < 8U)
+        {
+            ++unknown_logs;
+            pad_diag_append("trigger_unknown_type", type);
+            cloudplay::app_log("pad", "trigger_unknown_type", type);
+        }
         break;
+    }
     }
 }
 
@@ -403,21 +603,40 @@ bool radio_input_init(void)
     memset(&latest_pad, 0, sizeof(latest_pad));
     latest_pad.left_x = latest_pad.left_y = 128;
     latest_pad.right_x = latest_pad.right_y = 128;
+    pad_diag[0] = '\0';
+    pad_diag_append("pid", getpid());
+
     const int user_init = sceUserServiceInitialize(NULL);
     owns_user_service = user_init == 0;
+    pad_diag_append("user_init", user_init);
 
     int32_t user_id = -1;
-    if (sceUserServiceGetInitialUser(&user_id) < 0 || scePadInit() < 0)
+    const int user_get = sceUserServiceGetInitialUser(&user_id);
+    pad_diag_append("user_id", user_id);
+    pad_diag_append("user_get", user_get);
+    const int pad_init = scePadInit();
+    pad_diag_append("pad_init", pad_init);
+    if (user_get < 0 || pad_init < 0)
     {
         radio_input_shutdown();
         return false;
     }
+    /* Homebrew apps need elevated pad privilege for scePadSetTriggerEffect. */
+    last_privilege_result = scePadSetProcessPrivilege(1);
+    cloudplay::app_log("pad", "set_process_privilege", last_privilege_result);
+    pad_diag_append("set_process_privilege", last_privilege_result);
     pad_handle = scePadOpen(user_id, 0, 0, NULL);
     if (pad_handle < 0)
     {
+        pad_diag_append("pad_open", pad_handle);
         radio_input_shutdown();
         return false;
     }
+    cloudplay::app_log("pad", "open", pad_handle);
+    pad_diag_append("pad_open", pad_handle);
+    /* Some titles need privilege after the handle exists. */
+    last_privilege_result = scePadSetProcessPrivilege(1);
+    pad_diag_append("set_process_privilege_after_open", last_privilege_result);
     (void)scePadSetMotionSensorState(pad_handle, true);
     queue_read = queue_write = 0;
     button_state = 0;
@@ -431,12 +650,39 @@ bool radio_input_reset_orientation(void)
     return pad_handle >= 0 && scePadResetOrientation(pad_handle) >= 0;
 }
 
+static bool apply_merged_vibration(void)
+{
+    if (pad_handle < 0)
+        return false;
+    uint8_t haptic_l = last_haptic_low;
+    uint8_t haptic_h = last_haptic_high;
+    if (monotonic_milliseconds() > haptic_hold_until_ms)
+    {
+        haptic_l = 0;
+        haptic_h = 0;
+    }
+    /* Classic rumble stays until the stream sends (0,0). */
+    const pad_vibration_t vibration = {
+        last_rumble_low > haptic_l ? last_rumble_low : haptic_l,
+        last_rumble_high > haptic_h ? last_rumble_high : haptic_h,
+    };
+    return scePadSetVibration(pad_handle, &vibration) >= 0;
+}
+
 bool radio_input_set_vibration(uint8_t low_frequency, uint8_t high_frequency)
 {
     if (pad_handle < 0)
         return false;
-    const pad_vibration_t vibration = {low_frequency, high_frequency};
-    return scePadSetVibration(pad_handle, &vibration) >= 0;
+    last_rumble_low = low_frequency;
+    last_rumble_high = high_frequency;
+    return apply_merged_vibration();
+}
+
+bool radio_input_clear_haptic_audio(void)
+{
+    last_haptic_low = last_haptic_high = 0;
+    haptic_hold_until_ms = 0;
+    return apply_merged_vibration();
 }
 
 bool radio_input_set_haptic_audio(const int16_t *samples, size_t frame_count,
@@ -445,20 +691,37 @@ bool radio_input_set_haptic_audio(const int16_t *samples, size_t frame_count,
     if (!samples || frame_count == 0 || pad_handle < 0)
         return false;
     if (intensity == 0)
-        return radio_input_set_vibration(0, 0);
+        return radio_input_clear_haptic_audio();
 
+    /* Peak abs (not mean) — DualSense haptic bursts are short and sparse;
+     * averaging them into near-zero wiped most of the feel. */
+    uint32_t left_peak = 0;
+    uint32_t right_peak = 0;
     uint64_t left_sum = 0;
     uint64_t right_sum = 0;
     for (size_t i = 0; i < frame_count; ++i)
     {
         const int32_t left = samples[i * 2U];
         const int32_t right = samples[i * 2U + 1U];
-        left_sum += (uint32_t)(left < 0 ? -left : left);
-        right_sum += (uint32_t)(right < 0 ? -right : right);
+        const uint32_t la = (uint32_t)(left < 0 ? -left : left);
+        const uint32_t ra = (uint32_t)(right < 0 ? -right : right);
+        left_sum += la;
+        right_sum += ra;
+        if (la > left_peak)
+            left_peak = la;
+        if (ra > right_peak)
+            right_peak = ra;
     }
-    uint32_t left = (uint32_t)((left_sum / frame_count) >> 7U);
-    uint32_t right = (uint32_t)((right_sum / frame_count) >> 7U);
-    if (intensity == 2)
+    /* Blend peak (dominant) with a boosted mean so sustained tones still land. */
+    uint32_t left = (left_peak + (uint32_t)((left_sum / frame_count) * 2U)) >> 8U;
+    uint32_t right = (right_peak + (uint32_t)((right_sum / frame_count) * 2U)) >> 8U;
+    /* Strong (1) boosts — LRA→ERM approximation needs headroom. */
+    if (intensity == 1)
+    {
+        left = left * 3U / 2U;
+        right = right * 3U / 2U;
+    }
+    else if (intensity == 2)
     {
         left /= 2U;
         right /= 2U;
@@ -468,8 +731,25 @@ bool radio_input_set_haptic_audio(const int16_t *samples, size_t frame_count,
         left /= 3U;
         right /= 3U;
     }
-    return radio_input_set_vibration((uint8_t)(left > 255U ? 255U : left),
-                                     (uint8_t)(right > 255U ? 255U : right));
+    if (left > 255U)
+        left = 255U;
+    if (right > 255U)
+        right = 255U;
+    /* Noise floor: keep classic rumble latched; just refresh the motors. */
+    constexpr uint32_t kHapticFloor = 8U;
+    if (left < kHapticFloor && right < kHapticFloor)
+    {
+        if (monotonic_milliseconds() > haptic_hold_until_ms)
+        {
+            last_haptic_low = last_haptic_high = 0;
+            return apply_merged_vibration();
+        }
+        return true;
+    }
+    last_haptic_low = (uint8_t)left;
+    last_haptic_high = (uint8_t)right;
+    haptic_hold_until_ms = monotonic_milliseconds() + 60U;
+    return apply_merged_vibration();
 }
 
 bool radio_input_set_trigger_effects(uint8_t left_type, const uint8_t left[10],
@@ -482,13 +762,119 @@ bool radio_input_set_trigger_effects(uint8_t left_type, const uint8_t left[10],
     effect.trigger_mask = 0x03;
     decode_trigger_effect(&effect.command[0], left_type, left, intensity);
     decode_trigger_effect(&effect.command[1], right_type, right, intensity);
-    return scePadSetTriggerEffect(pad_handle, &effect) >= 0;
+    last_trigger_result = scePadSetTriggerEffect(pad_handle, &effect);
+    if (last_trigger_result < 0)
+    {
+        /* Slope may also be rejected on some firmwares — fall back to point feedback. */
+        bool converted = false;
+        for (unsigned i = 0; i < 2; ++i)
+        {
+            if (effect.command[i].mode != PAD_TRIGGER_EFFECT_SLOPE_FEEDBACK)
+                continue;
+            const uint8_t start = effect.command[i].data.slope_feedback.start_position;
+            uint8_t strength = effect.command[i].data.slope_feedback.start_strength;
+            if (effect.command[i].data.slope_feedback.end_strength > strength)
+                strength = effect.command[i].data.slope_feedback.end_strength;
+            memset(&effect.command[i].data, 0, sizeof(effect.command[i].data));
+            effect.command[i].mode = PAD_TRIGGER_EFFECT_FEEDBACK;
+            effect.command[i].data.feedback.position = start > 9 ? 9 : start;
+            effect.command[i].data.feedback.strength = strength;
+            converted = true;
+        }
+        if (converted)
+            last_trigger_result = scePadSetTriggerEffect(pad_handle, &effect);
+    }
+    if (last_trigger_result < 0)
+    {
+        static unsigned fail_logs;
+        if (fail_logs < 16U)
+        {
+            ++fail_logs;
+            cloudplay::app_log("pad", "set_trigger_effect", last_trigger_result);
+            pad_diag_append("set_trigger_effect", last_trigger_result);
+            pad_diag_append("trigger_left_type", left_type);
+            pad_diag_append("trigger_right_type", right_type);
+            pad_diag_append("trigger_left_mode", effect.command[0].mode);
+            pad_diag_append("trigger_right_mode", effect.command[1].mode);
+        }
+        return false;
+    }
+    static unsigned ok_logs;
+    if (ok_logs < 2U)
+    {
+        ++ok_logs;
+        pad_diag_append("set_trigger_effect_ok", last_trigger_result);
+        cloudplay::app_log("pad", "set_trigger_effect_ok", last_trigger_result);
+    }
+    return true;
 }
 
 bool radio_input_clear_trigger_effects(void)
 {
     const uint8_t empty[10] = {};
     return radio_input_set_trigger_effects(0x05, empty, 0x05, empty, 1);
+}
+
+int radio_input_run_trigger_test(int mode)
+{
+    if (pad_handle < 0)
+    {
+        last_trigger_result = -1;
+        pad_diag_append("trigger_test_no_pad", last_trigger_result);
+        return last_trigger_result;
+    }
+
+    /* Retry privilege right before the effect — useful for settings tests. */
+    last_privilege_result = scePadSetProcessPrivilege(1);
+    pad_diag_append("trigger_test_privilege", last_privilege_result);
+
+    uint8_t left[10] = {};
+    uint8_t right[10] = {};
+    uint8_t left_type = 0x05;
+    uint8_t right_type = 0x05;
+    switch (mode)
+    {
+    case 1: /* Soft resistance on both triggers */
+        left_type = right_type = 0x01;
+        left[0] = right[0] = 5;
+        left[1] = right[1] = 8;
+        break;
+    case 2: /* Weapon-style hard stop */
+        left_type = right_type = 0x02;
+        left[0] = right[0] = 2;
+        left[1] = right[1] = 7;
+        left[2] = right[2] = 8;
+        break;
+    case 3: /* Trigger vibration — chiaki layout: freq, amp, position */
+        left_type = right_type = 0x06;
+        left[0] = right[0] = 8; /* frequency (0 disables the effect) */
+        left[1] = right[1] = 8; /* amplitude */
+        left[2] = right[2] = 5; /* position 0..9 */
+        break;
+    default: /* Clear / off */
+        left_type = right_type = 0x05;
+        mode = 0;
+        break;
+    }
+
+    (void)radio_input_set_trigger_effects(left_type, left, right_type, right, 1);
+    pad_diag_append("trigger_test_mode", mode);
+    pad_diag_append("trigger_test_result", last_trigger_result);
+    /* Also log as unsigned hex-friendly decimal for SCE error codes. */
+    pad_diag_append("trigger_test_result_u",
+                    static_cast<int64_t>(static_cast<uint32_t>(last_trigger_result)));
+    cloudplay::app_log("pad", "trigger_test", last_trigger_result);
+    return last_trigger_result;
+}
+
+int radio_input_last_privilege_result(void)
+{
+    return last_privilege_result;
+}
+
+int radio_input_last_trigger_result(void)
+{
+    return last_trigger_result;
 }
 
 bool radio_input_pad_state(radio_input_pad_state_t *state)
@@ -540,6 +926,9 @@ bool radio_input_pressed(radio_input_key_t key)
 
 void radio_input_shutdown(void)
 {
+    last_rumble_low = last_rumble_high = 0;
+    last_haptic_low = last_haptic_high = 0;
+    haptic_hold_until_ms = 0;
     if (pad_handle >= 0)
     {
         const pad_vibration_t vibration = {0, 0};

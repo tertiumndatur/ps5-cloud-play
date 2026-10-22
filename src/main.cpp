@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -29,7 +30,12 @@ namespace {
 constexpr size_t catalog_columns = 6;
 constexpr size_t catalog_rows = 2;
 constexpr size_t catalog_slots = catalog_columns * catalog_rows;
-constexpr int settings_row_count = 7;
+constexpr int settings_row_count = 8;
+#if CLOUDPLAY_PS5
+constexpr int trigger_test_row = 7;
+int trigger_test_mode = 0; // 0 clear, 1 feedback, 2 weapon, 3 vibration
+std::string trigger_test_label = "Press X to test";
+#endif
 #if CLOUDPLAY_PS5
 constexpr uint64_t catalog_repeat_delay_ms = 320;
 constexpr uint64_t catalog_repeat_interval_ms = 90;
@@ -38,6 +44,19 @@ constexpr uint64_t catalog_repeat_interval_ms = 90;
 void debug_event(const char *event, int result = 0) {
     cloudplay::app_log("app", event, result);
 }
+
+#if CLOUDPLAY_PS5
+void apply_trigger_test(int direction) {
+    trigger_test_mode = (trigger_test_mode + direction + 4) % 4;
+    const int result = radio_input_run_trigger_test(trigger_test_mode);
+    const int privilege = radio_input_last_privilege_result();
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "priv=%d effect=0x%08X", privilege,
+                  static_cast<unsigned>(result));
+    trigger_test_label = buf;
+    debug_event("trigger_test", result);
+}
+#endif
 
 std::string resolution_label(int value) { return std::to_string(value) + "p"; }
 
@@ -369,6 +388,7 @@ void change(cloudplay::CloudSettings &settings, int focused, int direction) {
     } else if (focused == 6) {
         settings.show_stream_stats = !settings.show_stream_stats;
     }
+    /* focused == 7 (trigger test) is handled in the input loop — not a setting. */
 }
 
 #if CLOUDPLAY_PS5
@@ -390,6 +410,8 @@ cloudplay::CloudUiModel settings_ui_model(
         }
         return "IDR";
     };
+    const char *trigger_modes[] = {"Off / clear", "Soft resistance", "Weapon click",
+                                   "Trigger vibrate"};
     const std::string values[] = {
         settings.service == CloudService::PS5Cloud ? "PS5 Cloud" : "PS Now",
         resolution_label(settings.selected().resolution),
@@ -398,7 +420,8 @@ cloudplay::CloudUiModel settings_ui_model(
         settings.selected().datacenter,
         std::to_string(settings.selected().bitrate_kbps / 1000) + " Mbps",
         recovery_label(settings.selected().video_recovery_mode),
-        settings.show_stream_stats ? "On" : "Off"
+        settings.show_stream_stats ? "On" : "Off",
+        std::string(trigger_modes[trigger_test_mode % 4]) + " · " + trigger_test_label
     };
     const std::string defaults_text[] = {
         "", "Default " + resolution_label(default_service.resolution),
@@ -407,11 +430,12 @@ cloudplay::CloudUiModel settings_ui_model(
         "Default " + default_service.datacenter,
         "Default " + std::to_string(default_service.bitrate_kbps / 1000) + " Mbps",
         "Default " + std::string(recovery_label(default_service.video_recovery_mode)),
-        std::string("Default ") + (defaults.show_stream_stats ? "On" : "Off")
+        std::string("Default ") + (defaults.show_stream_stats ? "On" : "Off"),
+        "No game needed — feel L2/R2"
     };
     const char *labels[] = {"Cloud service", "Resolution", "Game language",
                             "Datacenter", "Bitrate", "Video recovery",
-                            "Show stream statistics"};
+                            "Show stream statistics", "Trigger test"};
     for (int index = 0; index < settings_row_count; ++index) {
         CloudUiRow row{labels[index], values[index], defaults_text[index], focused == index};
         if (index == 4) {
@@ -421,7 +445,7 @@ cloudplay::CloudUiModel settings_ui_model(
         model.rows.push_back(std::move(row));
     }
     model.status = server.status();
-    model.controls = "X - Change value";
+    model.controls = "X - Change value · Trigger test applies immediately";
     model.catalog_enabled = catalog_enabled;
     return model;
 }
@@ -778,8 +802,15 @@ int main(int argc, char **argv) {
                     if (key == SDLK_DOWN)
                         focused = (focused + 1) % settings_row_count;
                     if (key == SDLK_LEFT || key == SDLK_RIGHT) {
-                        change(settings, focused, key == SDLK_LEFT ? -1 : 1);
-                        debug_event("settings_saved", settings_store.save(settings));
+#if CLOUDPLAY_PS5
+                        if (focused == trigger_test_row) {
+                            apply_trigger_test(key == SDLK_LEFT ? -1 : 1);
+                        } else
+#endif
+                        {
+                            change(settings, focused, key == SDLK_LEFT ? -1 : 1);
+                            debug_event("settings_saved", settings_store.save(settings));
+                        }
                     }
                 }
 #if CLOUDPLAY_PS5
@@ -865,8 +896,13 @@ int main(int argc, char **argv) {
                         focused = (focused + 1) % settings_row_count;
                     if (input.key == RADIO_INPUT_LEFT || input.key == RADIO_INPUT_RIGHT ||
                         input.key == RADIO_INPUT_CROSS) {
-                        change(settings, focused, input.key == RADIO_INPUT_LEFT ? -1 : 1);
-                        debug_event("settings_saved", settings_store.save(settings));
+                        if (focused == trigger_test_row) {
+                            apply_trigger_test(input.key == RADIO_INPUT_LEFT ? -1 : 1);
+                        } else {
+                            change(settings, focused,
+                                   input.key == RADIO_INPUT_LEFT ? -1 : 1);
+                            debug_event("settings_saved", settings_store.save(settings));
+                        }
                     }
                 } else if (view == View::Resolves) {
                     const size_t count = psn_resolve_rules().size();

@@ -63,12 +63,19 @@ bool radio_input_pressed(radio_input_key_t key);
 bool radio_input_pad_state(radio_input_pad_state_t *state);
 bool radio_input_reset_orientation(void);
 bool radio_input_set_vibration(uint8_t low_frequency, uint8_t high_frequency);
+bool radio_input_clear_haptic_audio(void);
 bool radio_input_set_haptic_audio(const int16_t *samples, size_t frame_count,
                                   uint8_t intensity);
 bool radio_input_set_trigger_effects(uint8_t left_type, const uint8_t left[10],
                                      uint8_t right_type, const uint8_t right[10],
                                      uint8_t intensity);
 bool radio_input_clear_trigger_effects(void);
+/* Local DualSense check without a cloud stream.
+ * mode 0=clear, 1=feedback, 2=weapon, 3=vibration.
+ * Returns the raw scePadSetTriggerEffect result (0 on success). */
+int radio_input_run_trigger_test(int mode);
+int radio_input_last_privilege_result(void);
+int radio_input_last_trigger_result(void);
 void radio_input_shutdown(void);
 
 #ifdef __cplusplus
