@@ -11,7 +11,7 @@ SDL, and controller input is forwarded to the stream.
 The launcher uses the GPL-3.0-or-later
 [ps5-homebrew-ui](https://github.com/blackbearreloaded/ps5-homebrew-ui) rendering
 kit and its Paper Library design language. It renders through the
-[ps5-opengl](https://github.com/blackbearreloaded/ps5-opengl) OpenGL 4.6 stack;
+[ps5-opengl](https://github.com/darkxex/ps5-opengl) OpenGL 4.6 stack;
 SDL remains responsible only for streaming audio, timing, and events. The
 launcher releases EGL before the native AGC stream presenter takes the video
 output, then opens the Paper interface again when the stream ends.
